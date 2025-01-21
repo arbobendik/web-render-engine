@@ -28,11 +28,9 @@ async function buildScene() {
 	[camera.fx, camera.fy] = [-2.38, 0.8];
 	
 	
-	scene.primaryLightSources = [[100, 500, 100], [-100, 100, 500]];
+	scene.primaryLightSources = [[100, 500, 100]];
 	scene.primaryLightSources[0].intensity = 2000000;
 	scene.primaryLightSources[0].variation = 100;
-	scene.primaryLightSources[1].intensity = 1500000;
-	scene.primaryLightSources[1].variation = 100;
 	
 	
 	scene.ambientLight = [.01, .01, .01];
