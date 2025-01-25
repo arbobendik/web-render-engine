@@ -1,4 +1,5 @@
 "use strict";
+
 // Declare engine global.
 var engine;
 // Start scene buider
@@ -24,16 +25,16 @@ async function buildScene() {
 	});
 
 	// Set camera perspective and position.
-	[camera.x, camera.y, camera.z] = [0, 10, 0];
-	[camera.fx, camera.fy] = [-2.38, 0.8];
+	[camera.x, camera.y, camera.z] = [-10, 10, 10];
+	[camera.fx, camera.fy] = [-2.38, 0.4];
 	
 	
-	scene.primaryLightSources = [[100, 500, 100]];
-	scene.primaryLightSources[0].intensity = 2000000;
-	scene.primaryLightSources[0].variation = 100;
+	scene.primaryLightSources = [[-110, 100, 110]];
+	scene.primaryLightSources[0].intensity = 50000;
+	scene.primaryLightSources[0].variation = 0;
 	
 	
-	scene.ambientLight = [.01, .01, .01];
+	scene.ambientLight = [.1, .1, .1];
 	
 	// scene.queue.push(plane);
 
@@ -53,7 +54,12 @@ async function buildScene() {
 	var obj = await scene.importObj(modelUrl, mtl);
 	// obj.emissiveness = 0;
 	// obj.scale(5);
-	obj.move(5, 0, - 5);
+	obj.move(0, 0, -20);
+
+
+	let cube = scene.Cuboid(-1, 1, -1, 1, -1, 1);
+	cube.scale(100);
+	cube.move(0, -102, 0);
 	/*
 	obj.roughness = .1;
 	console.log(obj);
@@ -62,7 +68,7 @@ async function buildScene() {
 	obj.ior = 9.5;
 	obj.color = [255, 200, 90];
 	*/
-	scene.queue.push(obj);
+	scene.queue.push(cube, obj);
 	engine.renderer.updateScene();
 
 	// Add FPS counter to top-right corner
