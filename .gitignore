@@ -1,0 +1,5 @@
+public/build
+public/static/objects
+src/config-ui/node_modules
+src/flexlight/node_modules
+src/loader/node_modules
