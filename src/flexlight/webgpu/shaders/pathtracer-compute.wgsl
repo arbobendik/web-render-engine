@@ -345,29 +345,26 @@ fn traverseTriangleBVH(instance_index: u32, ray: Ray, max_len: f32, mask: bool) 
         let bv0 = access_triangle_bounding_vertices(vertex_offset);
         let bv1 = access_triangle_bounding_vertices(vertex_offset + 1u);
         let bv2 = access_triangle_bounding_vertices(vertex_offset + 2u);
-        let bv3 = access_triangle_bounding_vertices(vertex_offset + 3u);
-        let bv4 = access_triangle_bounding_vertices(vertex_offset + 4u);
 
         if (indicator_and_children.x == 0u) {
             if (local_mask) {
-                let a0 = bv0.xyz;
-                let b0 = vec3<f32>(bv0.w, bv1.xy);
-                let c0 = vec3<f32>(bv1.zw, bv2.x);
-                let a1 = bv2.yzw;
-                let b1 = bv3.xyz;
-                let c1 = vec3<f32>(bv3.w, bv4.xy);
                 // Run Moeller-Trumbore algorithm for both triangles
-                let intersection0 = moellerTrumbore(a0, b0, c0, t_ray, hit.suv.x * len_factor);
-                let intersection1 = moellerTrumbore(a1, b1, c1, t_ray, hit.suv.x * len_factor);
+                let intersection0 = moellerTrumbore(bv0.xyz, vec3<f32>(bv0.w, bv1.xy), vec3<f32>(bv1.zw, bv2.x), t_ray, hit.suv.x * len_factor);
                 // Test if ray even intersects
                 if(intersection0.x != 0.0) {
                     // Calculate intersection point
                     hit = Hit(vec3<f32>(intersection0.x / len_factor, intersection0.yz), instance_index, triangle_instance_offset / TRIANGLE_SIZE + indicator_and_children.y);
                 }
-                // Test if ray even intersects
-                if(intersection1.x != 0.0) {
-                    // Calculate intersection point
-                    hit = Hit(vec3<f32>(intersection1.x / len_factor, intersection1.yz), instance_index, triangle_instance_offset / TRIANGLE_SIZE + indicator_and_children.z);
+
+                if (indicator_and_children.z != UINT_MAX) {
+                    let bv3 = access_triangle_bounding_vertices(vertex_offset + 3u);
+                    let bv4 = access_triangle_bounding_vertices(vertex_offset + 4u);
+                    let intersection1 = moellerTrumbore(bv2.yzw, bv3.xyz, vec3<f32>(bv3.w, bv4.xy), t_ray, hit.suv.x * len_factor);
+                    // Test if ray even intersects
+                    if(intersection1.x != 0.0) {
+                        // Calculate intersection point
+                        hit = Hit(vec3<f32>(intersection1.x / len_factor, intersection1.yz), instance_index, triangle_instance_offset / TRIANGLE_SIZE + indicator_and_children.z);
+                    }
                 }
             }
         } else {
@@ -401,49 +398,18 @@ fn traverseTriangleBVH(instance_index: u32, ray: Ray, max_len: f32, mask: bool) 
             // Read as proper uniforms to maintain uniform control flow
             // let dist_0_uniform: f32 = workgroupUniformLoad(&triangle_dist0_uniform);
             // let dist_1_uniform: f32 = workgroupUniformLoad(&triangle_dist1_uniform);
+            let is_dist1_larger: bool = triangle_dist0_uniform < triangle_dist1_uniform;
 
-            var dist_near_uniform: f32 = POW32;
-            var dist_far_uniform: f32 = POW32;
-            var dist_near: f32 = POW32;
-            var dist_far: f32 = POW32;
+            let dist_near_uniform: f32 = select(triangle_dist0_uniform, triangle_dist1_uniform, is_dist1_larger);
+            let dist_far_uniform: f32 = select(triangle_dist1_uniform, triangle_dist0_uniform, is_dist1_larger);
+            let dist_near: f32 = select(dist0, dist1, is_dist1_larger);
+            let dist_far: f32 = select(dist1, dist0, is_dist1_larger);
 
-            var near_child: u32 = UINT_MAX;
-            var far_child: u32 = UINT_MAX;
-
-
-            if (triangle_dist0_uniform < triangle_dist1_uniform) {
-                dist_near_uniform = triangle_dist0_uniform;
-                dist_near = dist0;
-                near_child = indicator_and_children.y;
-
-                dist_far_uniform = triangle_dist1_uniform;
-                dist_far = dist1;
-                far_child = indicator_and_children.z;
-            } else {
-                dist_near_uniform = triangle_dist1_uniform;
-                dist_near = dist1;
-                near_child = indicator_and_children.z;
-
-                dist_far_uniform = triangle_dist0_uniform;
-                dist_far = dist0;
-                far_child = indicator_and_children.y;
-            }
+            let near_child: u32 = select(indicator_and_children.y, indicator_and_children.z, is_dist1_larger);
+            let far_child: u32 = select(indicator_and_children.z, indicator_and_children.y, is_dist1_larger);
 
             let is_local_near = local_mask && dist_near != POW32;
             let is_local_far = local_mask && dist_far != POW32;
-            /*
-
-            let dist0: f32 = rayBoundingVolume(min0, max0, t_ray, hit.suv.x * len_factor);
-            var dist1: f32 = POW32;
-            if (indicator_and_children.z != UINT_MAX) {
-                dist1 = rayBoundingVolume(min1, max1, t_ray, hit.suv.x * len_factor);
-            }
-
-            let dist_near = min(dist0, dist1);
-            let dist_far = max(dist0, dist1);
-            let near_child = select(indicator_and_children.z, indicator_and_children.y, dist0 < dist1);
-            let far_child = select(indicator_and_children.y, indicator_and_children.z, dist0 < dist1);
-            */
 
             // If node is an AABB, push children to stack, furthest first
             var next_stack_index: u32 = stack_index;
@@ -460,7 +426,7 @@ fn traverseTriangleBVH(instance_index: u32, ray: Ray, max_len: f32, mask: bool) 
                 next_stack_index += 1u;
             }
 
-            workgroupBarrier();
+            // workgroupBarrier();
 
             if (dist_near_uniform != POW32) {
                 triangle_stack[next_stack_index] = near_child;
@@ -475,18 +441,6 @@ fn traverseTriangleBVH(instance_index: u32, ray: Ray, max_len: f32, mask: bool) 
             }
 
             triangle_stack_index = next_stack_index;
-            /*
-
-            // If node is an AABB, push children to stack, furthest first
-            if (dist_far != POW32) {
-                stack[stack_index] = far_child;
-                stack_index += 1u;
-            }
-            if (dist_near != POW32) {
-                stack[stack_index] = near_child;
-                stack_index += 1u;
-            }
-            */
 
         }
     }
@@ -959,14 +913,15 @@ fn reservoirSample(material: Material, camera_ray: Ray, random_vec: vec4<f32>, s
     let offset_target: vec3<f32> = camera_ray.origin + geometry_offset * smooth_n;
     let light_ray: Ray = Ray(offset_target, unit_light_dir);
 
-    // return local_color + base_luminance;
+    return local_color + base_luminance;
     
-    
+    /*
     if (shadowTraverseInstanceBVH(light_ray, length(reservoir_dir))) {
         return base_luminance;
     } else {
         return local_color + base_luminance;
     }
+    */
 }
 
 var<workgroup> workgroup_stop_tracing: bool;
