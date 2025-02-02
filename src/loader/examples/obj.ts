@@ -85,7 +85,7 @@ let sphere = await loadObj('sphere');
 
 // const fullScene1 = scene.instance(fullScene);
 const cube1 = scene.instance(cube);
-// const cube2 = scene.instance(cube);
+const cube2 = scene.instance(cube);
 /*
 const monkey1 = scene.instance(monkey);
 */
@@ -108,7 +108,7 @@ cube1.transform.scaleFactor = 100;
 cube1.material.roughness = 1.0;
 cube1.material.metallic = 0.0;
 
-/*
+
 cube2.transform.position = new Vector(100, 0, -100);
 cube2.transform.rotateAxis(new Vector(0, 1, 0), Math.PI / 4);
 cube2.transform.scaleFactor = 100;
@@ -179,6 +179,7 @@ dragon_instance.transform.scaleFactor = 1;
 dragon_instance.material.roughness = 0.5;
 dragon_instance.material.metallic = 1.0;
 
+/*
 
 // init iterator variable for simple animations
 let iterator = 0;
@@ -196,6 +197,7 @@ setInterval(() => {
 
 // sphere1.transform.position = new Vector(0, 10, 0);
 
+*/
 
 
 // Add FPS counter to top-right corner

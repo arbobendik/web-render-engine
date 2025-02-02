@@ -264,6 +264,16 @@ fn moellerTrumboreCull(a: vec3<f32>, b: vec3<f32>, c: vec3<f32>, ray: Ray, l: f3
 }
 */
 
+fn read_mask(bit_mask: u32, depth: u32) -> bool {
+    return (bit_mask & (1u << depth)) != 0u;
+}
+fn set_mask(bit_mask: u32, depth: u32) -> u32 {
+    return bit_mask | (1u << depth);
+}
+fn unset_mask(bit_mask: u32, depth: u32) -> u32 {
+    return bit_mask & ~(1u << depth);
+}
+
 // Bounding volume intersection test
 fn rayBoundingVolume(min_corner: vec3<f32>, max_corner: vec3<f32>, ray: Ray, max_len: f32) -> f32 {
     let inv_dir: vec3<f32> = 1.0f / ray.unit_direction;
@@ -279,11 +289,20 @@ fn rayBoundingVolume(min_corner: vec3<f32>, max_corner: vec3<f32>, ray: Ray, max
     }
 }
 
+var<workgroup> triangle_stack: array<u32, 24>;
+var<workgroup> triangle_stack_index: u32;
 
+var<workgroup> triangle_dist0_atomic: atomic<i32>;
+var<workgroup> triangle_dist1_atomic: atomic<i32>;
+
+var<workgroup> triangle_dist0_uniform: f32;
+var<workgroup> triangle_dist1_uniform: f32;
+
+var<workgroup> triangle_indicator_and_children: vec3<u32>;
 // Test for closest ray triangle intersection
 // return intersection position in world space and index of target triangle in geometryTex
 // plus instance and triangle index
-fn traverseTriangleBVH(instance_index: u32, ray: Ray, max_len: f32) -> Hit {
+fn traverseTriangleBVH(instance_index: u32, ray: Ray, max_len: f32, mask: bool) -> Hit {
     // Maximal distance a triangle can be away from the ray origin
     let instance_uint_offset = instance_index * INSTANCE_UINT_SIZE;
 
@@ -300,7 +319,179 @@ fn traverseTriangleBVH(instance_index: u32, ray: Ray, max_len: f32) -> Hit {
     let triangle_instance_offset: u32 = instance_uint[instance_uint_offset];
     let instance_bvh_offset: u32 = instance_uint[instance_uint_offset + 1u];
     let instance_vertex_offset: u32 = instance_uint[instance_uint_offset + 2u];
+    // Hit object
+    // First element of vector is current closest intersection point
+    var hit: Hit = Hit(vec3<f32>(max_len, 0.0f, 0.0f), UINT_MAX, UINT_MAX);
+    // Stack for BVH traversal
+    // var stack: array<u32, 24> = array<u32, 24>();
+    // var stack_index: u32 = 1u;
+    triangle_stack[0u] = 0u;
+    triangle_stack_index = 1u;
+    var local_stack_mask: u32 = 1u;
 
+    while (workgroupUniformLoad(&triangle_stack_index) > 0u) {
+        let stack_index: u32 = workgroupUniformLoad(&triangle_stack_index) - 1u;
+        triangle_stack_index = stack_index;
+        let local_mask: bool = mask && read_mask(local_stack_mask, stack_index);
+        let node_index: u32 = triangle_stack[stack_index];
+
+        let bvh_offset: u32 = instance_bvh_offset + node_index * BVH_TRIANGLE_SIZE;
+        let vertex_offset: u32 = instance_vertex_offset + node_index * TRIANGLE_BOUNDING_VERTICES_SIZE;
+
+        // let indicator_and_children: vec3<u32> = access_triangle_bvh(bvh_offset).xyz;
+        triangle_indicator_and_children = access_triangle_bvh(bvh_offset).xyz;
+        let indicator_and_children = workgroupUniformLoad(&triangle_indicator_and_children);
+
+        let bv0 = access_triangle_bounding_vertices(vertex_offset);
+        let bv1 = access_triangle_bounding_vertices(vertex_offset + 1u);
+        let bv2 = access_triangle_bounding_vertices(vertex_offset + 2u);
+        let bv3 = access_triangle_bounding_vertices(vertex_offset + 3u);
+        let bv4 = access_triangle_bounding_vertices(vertex_offset + 4u);
+
+        if (indicator_and_children.x == 0u) {
+            if (local_mask) {
+                let a0 = bv0.xyz;
+                let b0 = vec3<f32>(bv0.w, bv1.xy);
+                let c0 = vec3<f32>(bv1.zw, bv2.x);
+                let a1 = bv2.yzw;
+                let b1 = bv3.xyz;
+                let c1 = vec3<f32>(bv3.w, bv4.xy);
+                // Run Moeller-Trumbore algorithm for both triangles
+                let intersection0 = moellerTrumbore(a0, b0, c0, t_ray, hit.suv.x * len_factor);
+                let intersection1 = moellerTrumbore(a1, b1, c1, t_ray, hit.suv.x * len_factor);
+                // Test if ray even intersects
+                if(intersection0.x != 0.0) {
+                    // Calculate intersection point
+                    hit = Hit(vec3<f32>(intersection0.x / len_factor, intersection0.yz), instance_index, triangle_instance_offset / TRIANGLE_SIZE + indicator_and_children.y);
+                }
+                // Test if ray even intersects
+                if(intersection1.x != 0.0) {
+                    // Calculate intersection point
+                    hit = Hit(vec3<f32>(intersection1.x / len_factor, intersection1.yz), instance_index, triangle_instance_offset / TRIANGLE_SIZE + indicator_and_children.z);
+                }
+            }
+        } else {
+            let min0 = bv0.xyz;
+            let max0 = vec3<f32>(bv0.w, bv1.xy);
+            let min1 = vec3<f32>(bv1.zw, bv2.x);
+            let max1 = bv2.yzw;
+
+            var dist0: f32 = POW32;
+            var dist1: f32 = POW32;
+
+            if (local_mask) {
+                dist0 = rayBoundingVolume(min0, max0, t_ray, hit.suv.x * len_factor);
+                if (indicator_and_children.z != UINT_MAX) {
+                    dist1 = rayBoundingVolume(min1, max1, t_ray, hit.suv.x * len_factor);
+                }
+            }
+
+            atomicStore(&triangle_dist0_atomic, bitcast<i32>(POW32));
+            atomicStore(&triangle_dist1_atomic, bitcast<i32>(POW32));
+
+            workgroupBarrier();
+            // Find closest distances across workgroup and order accordingly
+            atomicMin(&triangle_dist0_atomic, bitcast<i32>(dist0));
+            atomicMin(&triangle_dist1_atomic, bitcast<i32>(dist1));
+            // Wait for all threads to compare distances
+            workgroupBarrier();
+
+            triangle_dist0_uniform = bitcast<f32>(atomicLoad(&triangle_dist0_atomic));
+            triangle_dist1_uniform = bitcast<f32>(atomicLoad(&triangle_dist1_atomic));
+            // Read as proper uniforms to maintain uniform control flow
+            // let dist_0_uniform: f32 = workgroupUniformLoad(&triangle_dist0_uniform);
+            // let dist_1_uniform: f32 = workgroupUniformLoad(&triangle_dist1_uniform);
+
+            var dist_near_uniform: f32 = POW32;
+            var dist_far_uniform: f32 = POW32;
+            var dist_near: f32 = POW32;
+            var dist_far: f32 = POW32;
+
+            var near_child: u32 = UINT_MAX;
+            var far_child: u32 = UINT_MAX;
+
+
+            if (triangle_dist0_uniform < triangle_dist1_uniform) {
+                dist_near_uniform = triangle_dist0_uniform;
+                dist_near = dist0;
+                near_child = indicator_and_children.y;
+
+                dist_far_uniform = triangle_dist1_uniform;
+                dist_far = dist1;
+                far_child = indicator_and_children.z;
+            } else {
+                dist_near_uniform = triangle_dist1_uniform;
+                dist_near = dist1;
+                near_child = indicator_and_children.z;
+
+                dist_far_uniform = triangle_dist0_uniform;
+                dist_far = dist0;
+                far_child = indicator_and_children.y;
+            }
+
+            let is_local_near = local_mask && dist_near != POW32;
+            let is_local_far = local_mask && dist_far != POW32;
+            /*
+
+            let dist0: f32 = rayBoundingVolume(min0, max0, t_ray, hit.suv.x * len_factor);
+            var dist1: f32 = POW32;
+            if (indicator_and_children.z != UINT_MAX) {
+                dist1 = rayBoundingVolume(min1, max1, t_ray, hit.suv.x * len_factor);
+            }
+
+            let dist_near = min(dist0, dist1);
+            let dist_far = max(dist0, dist1);
+            let near_child = select(indicator_and_children.z, indicator_and_children.y, dist0 < dist1);
+            let far_child = select(indicator_and_children.y, indicator_and_children.z, dist0 < dist1);
+            */
+
+            // If node is an AABB, push children to stack, furthest first
+            var next_stack_index: u32 = stack_index;
+
+            if (dist_far_uniform != POW32) {
+                triangle_stack[next_stack_index] = far_child;
+                // Set mask bit for local thread
+                if (is_local_far) {
+                    local_stack_mask = set_mask(local_stack_mask, next_stack_index);
+                } else {
+                    local_stack_mask = unset_mask(local_stack_mask, next_stack_index);
+                }
+                // Increment stack index
+                next_stack_index += 1u;
+            }
+
+            workgroupBarrier();
+
+            if (dist_near_uniform != POW32) {
+                triangle_stack[next_stack_index] = near_child;
+                // Set mask bit for local thread
+                if (is_local_near) {
+                    local_stack_mask = set_mask(local_stack_mask, next_stack_index);
+                } else {
+                    local_stack_mask = unset_mask(local_stack_mask, next_stack_index);
+                }
+                // Increment stack index
+                next_stack_index += 1u;
+            }
+
+            triangle_stack_index = next_stack_index;
+            /*
+
+            // If node is an AABB, push children to stack, furthest first
+            if (dist_far != POW32) {
+                stack[stack_index] = far_child;
+                stack_index += 1u;
+            }
+            if (dist_near != POW32) {
+                stack[stack_index] = near_child;
+                stack_index += 1u;
+            }
+            */
+
+        }
+    }
+    
+    /*
     // Hit object
     // First element of vector is current closest intersection point
     var hit: Hit = Hit(vec3<f32>(max_len, 0.0f, 0.0f), UINT_MAX, UINT_MAX);
@@ -371,70 +562,152 @@ fn traverseTriangleBVH(instance_index: u32, ray: Ray, max_len: f32) -> Hit {
             }
         }
     }
+    */
     // Return hit object
     return hit;
 }
 
+var<workgroup> instance_stack: array<u32, 16>;
+var<workgroup> instance_stack_index: u32;
+
+var<workgroup> instance_dist0_atomic: atomic<i32>;
+var<workgroup> instance_dist1_atomic: atomic<i32>;
+
+var<workgroup> instance_dist0_uniform: f32;
+var<workgroup> instance_dist1_uniform: f32;
+
+var<workgroup> instance_indicator_and_children: vec3<u32>;
 
 // Simplified rayTracer to only test if ray intersects anything
-fn traverseInstanceBVH(ray: Ray) -> Hit {
+fn traverseInstanceBVH(ray: Ray, mask: bool) -> Hit {
     // Hit object
     // Maximal distance a triangle can be away from the ray origin is POW32 at initialisation
     var hit: Hit = Hit(vec3<f32>(POW32, 0.0f, 0.0f), UINT_MAX, UINT_MAX);
     // Stack for BVH traversal
-    var stack = array<u32, 16>();
-    var stack_index: u32 = 1u;
+    // var stack = array<u32, 16>();
+    // var stack_index: u32 = 1u;
+    instance_stack[0u] = 0u;
+    instance_stack_index = 1u;
+    var local_stack_mask: u32 = 1u;
 
-    while (stack_index > 0u) {
-        stack_index -= 1u;
-        let node_index: u32 = stack[stack_index];
+    while (workgroupUniformLoad(&instance_stack_index) > 0u) {
+        let stack_index: u32 = workgroupUniformLoad(&instance_stack_index) - 1u;
+        instance_stack_index = stack_index;
+        let local_mask: bool = mask && read_mask(local_stack_mask, stack_index);
+        let node_index: u32 = instance_stack[stack_index];
 
         let bvh_offset: u32 = node_index * BVH_INSTANCE_SIZE;
         let vertex_offset: u32 = node_index * INSTANCE_BOUNDING_VERTICES_SIZE;
         
-        let indicator_and_children: vec3<u32> = instance_bvh[bvh_offset];
+        // let indicator_and_children: vec3<u32> =
+        instance_indicator_and_children = instance_bvh[bvh_offset];
+        let indicator_and_children = workgroupUniformLoad(&instance_indicator_and_children);
 
-        let min0 = instance_bounding_vertices[vertex_offset];
-        let max0 = instance_bounding_vertices[vertex_offset + 1u];
-        let min1 = instance_bounding_vertices[vertex_offset + 2u];
-        let max1 = instance_bounding_vertices[vertex_offset + 3u];
-
-        let dist0 = rayBoundingVolume(min0, max0, ray, hit.suv.x);
-        
+        var dist0: f32 = POW32;
         var dist1: f32 = POW32;
-        if (indicator_and_children.z != UINT_MAX) {
+
+        if (local_mask) {
+            let min0 = instance_bounding_vertices[vertex_offset];
+            let max0 = instance_bounding_vertices[vertex_offset + 1u];
+            let min1 = instance_bounding_vertices[vertex_offset + 2u];
+            let max1 = instance_bounding_vertices[vertex_offset + 3u];
+            
+            dist0 = rayBoundingVolume(min0, max0, ray, hit.suv.x);
             dist1 = rayBoundingVolume(min1, max1, ray, hit.suv.x);
         }
 
-        let dist_near = min(dist0, dist1);
-        let dist_far = max(dist0, dist1);
-        let near_child = select(indicator_and_children.z, indicator_and_children.y, dist0 < dist1);
-        let far_child = select(indicator_and_children.y, indicator_and_children.z, dist0 < dist1);
+        atomicStore(&instance_dist0_atomic, bitcast<i32>(POW32));
+        atomicStore(&instance_dist1_atomic, bitcast<i32>(POW32));
+
+        workgroupBarrier();
+        // Find closest distances across workgroup and order accordingly
+        atomicMin(&instance_dist0_atomic, bitcast<i32>(dist0));
+        atomicMin(&instance_dist1_atomic, bitcast<i32>(dist1));
+        // Wait for all threads to compare distances
+        workgroupBarrier();
+
+        instance_dist0_uniform = bitcast<f32>(atomicLoad(&instance_dist0_atomic));
+        instance_dist1_uniform = bitcast<f32>(atomicLoad(&instance_dist1_atomic));
+        // Read as proper uniforms to maintain uniform control flow
+        let dist_0_uniform: f32 = workgroupUniformLoad(&instance_dist0_uniform);
+        let dist_1_uniform: f32 = workgroupUniformLoad(&instance_dist1_uniform);
+
+        var dist_near_uniform: f32 = POW32;
+        var dist_far_uniform: f32 = POW32;
+        var dist_near: f32 = POW32;
+        var dist_far: f32 = POW32;
+
+        var near_child: u32 = UINT_MAX;
+        var far_child: u32 = UINT_MAX;
+
+
+        if (dist_0_uniform < dist_1_uniform) {
+            dist_near_uniform = dist_0_uniform;
+            dist_near = dist0;
+            near_child = indicator_and_children.y;
+
+            dist_far_uniform = dist_1_uniform;
+            dist_far = dist1;
+            far_child = indicator_and_children.z;
+        } else {
+            dist_near_uniform = dist_1_uniform;
+            dist_near = dist1;
+            near_child = indicator_and_children.z;
+
+            dist_far_uniform = dist_0_uniform;
+            dist_far = dist0;
+            far_child = indicator_and_children.y;
+        }
+
+        let is_local_near = local_mask && dist_near != POW32;
+        let is_local_far = local_mask && dist_far != POW32;
 
         if (indicator_and_children.x == 0u) {
             // If node is a triangle, test for intersection, closest first
-            if (dist_near != POW32) {
-                let new_hit: Hit = traverseTriangleBVH(near_child, ray, hit.suv.x);
-                if (new_hit.suv.x < hit.suv.x) {
-                    hit = new_hit;
+
+            if (dist_near_uniform != POW32) {
+                let near_hit: Hit = traverseTriangleBVH(near_child, ray, hit.suv.x, is_local_near);
+                if (is_local_near && near_hit.suv.x < hit.suv.x) {
+                    hit = near_hit;
                 }
             }
-            if (dist_far != POW32) {
-                let new_hit: Hit = traverseTriangleBVH(far_child, ray, hit.suv.x);
-                if (new_hit.suv.x < hit.suv.x) {
-                    hit = new_hit;
+            if (dist_far_uniform != POW32) {
+                let far_hit: Hit = traverseTriangleBVH(far_child, ray, hit.suv.x, is_local_far);
+                if (is_local_far && far_hit.suv.x < hit.suv.x) {
+                    hit = far_hit;
                 }
             }
         } else {
             // If node is an AABB, push children to stack, furthest first
-            if (dist_far != POW32) {
-                stack[stack_index] = far_child;
-                stack_index += 1u;
+            var next_stack_index: u32 = stack_index;
+
+            if (dist_far_uniform != POW32) {
+                instance_stack[next_stack_index] = far_child;
+                // Set mask bit for local thread
+                if (is_local_far) {
+                    local_stack_mask = set_mask(local_stack_mask, next_stack_index);
+                } else {
+                    local_stack_mask = unset_mask(local_stack_mask, next_stack_index);
+                }
+                // Increment stack index
+                next_stack_index += 1u;
             }
-            if (dist_near != POW32) {
-                stack[stack_index] = near_child;
-                stack_index += 1u;
+
+            workgroupBarrier();
+
+            if (dist_near_uniform != POW32) {
+                instance_stack[next_stack_index] = near_child;
+                // Set mask bit for local thread
+                if (is_local_near) {
+                    local_stack_mask = set_mask(local_stack_mask, next_stack_index);
+                } else {
+                    local_stack_mask = unset_mask(local_stack_mask, next_stack_index);
+                }
+                // Increment stack index
+                next_stack_index += 1u;
             }
+
+            instance_stack_index = next_stack_index;
         }
     }
     // Return hit object
@@ -499,10 +772,7 @@ fn shadowTraverseTriangleBVH(instance_index: u32, ray: Ray, l: f32) -> bool {
             let max1 = bv2.yzw;
 
             let dist0: f32 = rayBoundingVolume(min0, max0, t_ray, max_len);
-            var dist1: f32 = POW32;
-            if (indicator_and_children.z != UINT_MAX) {
-                dist1 = rayBoundingVolume(min1, max1, t_ray, max_len);
-            }
+            let dist1: f32 = rayBoundingVolume(min1, max1, t_ray, max_len);
 
             let dist_near = min(dist0, dist1);
             let dist_far = max(dist0, dist1);
@@ -529,7 +799,7 @@ fn shadowTraverseInstanceBVH(ray: Ray, l: f32) -> bool {
     // Get texture size as max iteration value
     var stack = array<u32, 16>();
     var stack_index: u32 = 1u;
-
+    
     while (stack_index > 0u) {
         stack_index -= 1u;
         let node_index: u32 = stack[stack_index];
@@ -691,6 +961,7 @@ fn reservoirSample(material: Material, camera_ray: Ray, random_vec: vec4<f32>, s
 
     // return local_color + base_luminance;
     
+    
     if (shadowTraverseInstanceBVH(light_ray, length(reservoir_dir))) {
         return base_luminance;
     } else {
@@ -698,9 +969,9 @@ fn reservoirSample(material: Material, camera_ray: Ray, random_vec: vec4<f32>, s
     }
 }
 
+var<workgroup> workgroup_stop_tracing: bool;
 
-
-fn lightTrace(init_hit: Hit, origin: vec3<f32>, camera: vec3<f32>, clip_space: vec2<f32>, cos_sample_n: f32) -> vec3<f32> {
+fn lightTrace(init_hit: Hit, origin: vec3<f32>, camera: vec3<f32>, clip_space: vec2<f32>, cos_sample_n: f32, mask: bool) -> vec3<f32> {
     // Use additive color mixing technique, so start with black
     var final_color: vec3<f32> = vec3<f32>(0.0f);
     var importancy_factor: vec3<f32> = vec3(1.0f);
@@ -709,133 +980,183 @@ fn lightTrace(init_hit: Hit, origin: vec3<f32>, camera: vec3<f32>, clip_space: v
     var ray: Ray = Ray(camera, normalize(origin - camera));
     var last_hit_point: vec3<f32> = camera;
     // Iterate over each bounce and modify color accordingly
-    for (var i: u32 = 0u; i < uniforms_uint.max_reflections && length(importancy_factor) >= uniforms_float.min_importancy * SQRT3; i++) {
-        let instance_uint_offset: u32 = hit.instance_index * INSTANCE_UINT_SIZE;
-        let triangle_offset: u32 = hit.triangle_index * TRIANGLE_SIZE;
+    var continue_tracing: bool = mask;
+    var i: u32 = 0u;
 
 
-        let t0: vec4<f32> = access_triangle(triangle_offset);
-        let t1: vec4<f32> = access_triangle(triangle_offset + 1u);
-        let t2: vec4<f32> = access_triangle(triangle_offset + 2u);
-        let t3: vec4<f32> = access_triangle(triangle_offset + 3u);
-        let t4: vec4<f32> = access_triangle(triangle_offset + 4u);
-        let t5: vec4<f32> = access_triangle(triangle_offset + 5u);
-        // Fetch triangle coordinates from scene graph texture
-        let relative_t: mat3x3<f32> = mat3x3<f32>(
-            vec3<f32>(t0.xyz),
-            vec3<f32>(t0.w, t1.xy),
-            vec3<f32>(t1.zw, t2.x)
-        );
-
-        let transform: Transform = instance_transform[hit.instance_index * 2u];
-        // Transform triangle
-        let t: mat3x3<f32> = transform.rotation * relative_t;
-        // Transform hit point
-        ray.origin = hit.suv.x * ray.unit_direction + ray.origin;
-        let offset_ray_target: vec3<f32> = ray.origin - transform.shift;
-        
-        let geometry_n: vec3<f32> = normalize(cross(t[0] - t[1], t[0] - t[2]));
-        let diffs: vec3<f32> = vec3<f32>(
-            distance(offset_ray_target, t[0]),
-            distance(offset_ray_target, t[1]),
-            distance(offset_ray_target, t[2])
-        );
-        // Pull normals
-        let normals: mat3x3<f32> = transform.rotation * mat3x3<f32>(
-            vec3<f32>(t2.yzw),
-            vec3<f32>(t3.xyz),
-            vec3<f32>(t3.w, t4.xy)
-        );
-        // Calculate barycentric coordinates
-        let uvw: vec3<f32> = vec3<f32>(1.0f - hit.suv.y - hit.suv.z, hit.suv.y, hit.suv.z);
-        // Interpolate smooth normal
-        var smooth_n: vec3<f32> = normalize(normals * uvw);
-        // to prevent unnatural hard shadow / reflection borders due to the difference between the smooth normal and geometry
-        let angles: vec3<f32> = acos(abs(geometry_n * normals));
-        let angle_tan: vec3<f32> = clamp(tan(angles), vec3<f32>(0.0f), vec3<f32>(1.0f));
-        let geometry_offset: f32 = dot(diffs * angle_tan, uvw);
-        // Interpolate final barycentric texture coordinates between UV's of the respective vertices
-        
-        let barycentric: vec2<f32> = mat3x2<f32>(
-            vec2<f32>(t4.zw),
-            vec2<f32>(t5.xy),
-            vec2<f32>(t5.zw)
-        ) * uvw;
-        
-        // Gather material attributes (albedo, roughness, metallicity, emissiveness, translucency, particel density and optical density aka. IOR) out of world texture
+    while (!workgroupUniformLoad(&workgroup_stop_tracing)) {
+        // Variables needed accross blocks
         /*
-        let tex_num: vec3<f32>          = vec3<f32>(scene[index_s + 15], scene[index_s + 16], scene[index_s + 17]);
+        var material: Material;
+        var sign_dir: f32;
+        var smooth_n: vec3<f32>;
+        var geometry_offset: f32;
 
-        let albedo_default: vec3<f32>   = vec3<f32>(scene[index_s + 18], scene[index_s + 19], scene[index_s + 20]);
-        let rme_default: vec3<f32>      = vec3<f32>(scene[index_s + 21], scene[index_s + 22], scene[index_s + 23]);
-        let tpo_default: vec3<f32>      = vec3<f32>(scene[index_s + 24], scene[index_s + 25], scene[index_s + 26]);
-
-        let material: Material = Material (
-            fetchTexVal(texture_atlas, barycentric, tex_num.x, albedo_default),
-            fetchTexVal(pbr_atlas, barycentric, tex_num.y, rme_default),
-            fetchTexVal(translucency_atlas, barycentric, tex_num.z, tpo_default),
-        );
+        var random_spheare_vec: vec3<f32>;
+        var roughness_brdf: f32;
+        var is_solid: bool;
         */
-        // Sample material
-        let material: Material = instance_material[hit.instance_index];
-        ray = Ray(ray.origin, normalize(ray.origin - last_hit_point));
-        // If ray reflects from inside or onto an transparent object,
-        // the surface faces in the opposite direction as usual
-        var sign_dir: f32 = sign(dot(ray.unit_direction, smooth_n));
-        smooth_n *= - sign_dir;
 
-        // Generate pseudo random vector
-        let fi: f32 = f32(i);
-        let random_vec: vec4<f32> = noise(clip_space.xy * length(ray.origin - last_hit_point), fi + cos_sample_n * PHI);
-        let random_spheare_vec: vec3<f32> = normalize(smooth_n + normalize(random_vec.xyz));
-        let brdf: f32 = mix(1.0f, abs(dot(smooth_n, ray.unit_direction)), material.metallic);
+        if (continue_tracing) {
+            let instance_uint_offset: u32 = hit.instance_index * INSTANCE_UINT_SIZE;
+            let triangle_offset: u32 = hit.triangle_index * TRIANGLE_SIZE;
 
-        // Alter normal according to roughness value
-        let roughness_brdf: f32 = material.roughness * brdf;
-        let rough_n: vec3<f32> = normalize(mix(smooth_n, random_spheare_vec, roughness_brdf));
 
-        let h: vec3<f32> = normalize(rough_n - ray.unit_direction);
-        let v_dot_h = max(dot(- ray.unit_direction, h), 0.0f);
-        let f0: vec3<f32> = material.albedo * brdf;
-        let f: vec3<f32> = fresnel(f0, v_dot_h);
+            let t0: vec4<f32> = access_triangle(triangle_offset);
+            let t1: vec4<f32> = access_triangle(triangle_offset + 1u);
+            let t2: vec4<f32> = access_triangle(triangle_offset + 2u);
+            let t3: vec4<f32> = access_triangle(triangle_offset + 3u);
+            let t4: vec4<f32> = access_triangle(triangle_offset + 4u);
+            let t5: vec4<f32> = access_triangle(triangle_offset + 5u);
+            // Fetch triangle coordinates from scene graph texture
+            let relative_t: mat3x3<f32> = mat3x3<f32>(
+                vec3<f32>(t0.xyz),
+                vec3<f32>(t0.w, t1.xy),
+                vec3<f32>(t1.zw, t2.x)
+            );
 
-        let fresnel_reflect: f32 = max(f.x, max(f.y, f.z));
-        // object is solid or translucent by chance because of the fresnel effect
-        let is_solid: bool = material.transmission * fresnel_reflect <= abs(random_vec.w);
-        // Determine local color considering PBR attributes and lighting
-        let local_color: vec3<f32> = reservoirSample(material, ray, random_vec, - sign_dir * smooth_n, geometry_offset);
-        // Calculate primary light sources for this pass if ray hits non translucent object
-        final_color += local_color * importancy_factor;
+            let transform: Transform = instance_transform[hit.instance_index * 2u];
+            // Transform triangle
+            let t: mat3x3<f32> = transform.rotation * relative_t;
+            // Transform hit point
+            ray.origin = hit.suv.x * ray.unit_direction + ray.origin;
+            let offset_ray_target: vec3<f32> = ray.origin - transform.shift;
+            
+            let geometry_n: vec3<f32> = normalize(cross(t[0] - t[1], t[0] - t[2]));
+            let diffs: vec3<f32> = vec3<f32>(
+                distance(offset_ray_target, t[0]),
+                distance(offset_ray_target, t[1]),
+                distance(offset_ray_target, t[2])
+            );
+            // Pull normals
+            let normals: mat3x3<f32> = transform.rotation * mat3x3<f32>(
+                vec3<f32>(t2.yzw),
+                vec3<f32>(t3.xyz),
+                vec3<f32>(t3.w, t4.xy)
+            );
+            // Calculate barycentric coordinates
+            let uvw: vec3<f32> = vec3<f32>(1.0f - hit.suv.y - hit.suv.z, hit.suv.y, hit.suv.z);
+            // Interpolate smooth normal
+            var smooth_n: vec3<f32> = normalize(normals * uvw);
+            // to prevent unnatural hard shadow / reflection borders due to the difference between the smooth normal and geometry
+            let angles: vec3<f32> = acos(abs(geometry_n * normals));
+            let angle_tan: vec3<f32> = clamp(tan(angles), vec3<f32>(0.0f), vec3<f32>(1.0f));
+            let geometry_offset: f32 = dot(diffs * angle_tan, uvw);
+            // Interpolate final barycentric texture coordinates between UV's of the respective vertices
+            
+            let barycentric: vec2<f32> = mat3x2<f32>(
+                vec2<f32>(t4.zw),
+                vec2<f32>(t5.xy),
+                vec2<f32>(t5.zw)
+            ) * uvw;
+            
+            // Gather material attributes (albedo, roughness, metallicity, emissiveness, translucency, particel density and optical density aka. IOR) out of world texture
+            /*
+            let tex_num: vec3<f32>          = vec3<f32>(scene[index_s + 15], scene[index_s + 16], scene[index_s + 17]);
 
-        // Multiply albedo with either absorption value or filter color
-        importancy_factor = importancy_factor * material.albedo;
-        // Test for early termination
-        if (i + 1u >= uniforms_uint.max_reflections || length(importancy_factor) < uniforms_float.min_importancy * SQRT3) {
-            break;
-        }
-        // Handle translucency and skip rest of light calculation
-        if(is_solid) {
+            let albedo_default: vec3<f32>   = vec3<f32>(scene[index_s + 18], scene[index_s + 19], scene[index_s + 20]);
+            let rme_default: vec3<f32>      = vec3<f32>(scene[index_s + 21], scene[index_s + 22], scene[index_s + 23]);
+            let tpo_default: vec3<f32>      = vec3<f32>(scene[index_s + 24], scene[index_s + 25], scene[index_s + 26]);
+
+            let material: Material = Material (
+                fetchTexVal(texture_atlas, barycentric, tex_num.x, albedo_default),
+                fetchTexVal(pbr_atlas, barycentric, tex_num.y, rme_default),
+                fetchTexVal(translucency_atlas, barycentric, tex_num.z, tpo_default),
+            );
+            */
+            // Sample material
+            let material: Material = instance_material[hit.instance_index];
+            ray = Ray(ray.origin, normalize(ray.origin - last_hit_point));
+            // If ray reflects from inside or onto an transparent object,
+            // the surface faces in the opposite direction as usual
+            let sign_dir: f32 = sign(dot(ray.unit_direction, smooth_n));
+            smooth_n *= - sign_dir;
+
+            // Generate pseudo random vector
+            let fi: f32 = f32(i);
+            let random_vec: vec4<f32> = noise(clip_space.xy * length(ray.origin - last_hit_point), fi + cos_sample_n * PHI);
+            let random_spheare_vec: vec3<f32> = normalize(smooth_n + normalize(random_vec.xyz));
+            let brdf: f32 = mix(1.0f, abs(dot(smooth_n, ray.unit_direction)), material.metallic);
+
+            // Alter normal according to roughness value
+            let roughness_brdf: f32 = material.roughness * brdf;
+            let rough_n: vec3<f32> = normalize(mix(smooth_n, random_spheare_vec, roughness_brdf));
+
+            let h: vec3<f32> = normalize(rough_n - ray.unit_direction);
+            let v_dot_h = max(dot(- ray.unit_direction, h), 0.0f);
+            let f0: vec3<f32> = material.albedo * brdf;
+            let f: vec3<f32> = fresnel(f0, v_dot_h);
+
+            let fresnel_reflect: f32 = max(f.x, max(f.y, f.z));
+            // object is solid or translucent by chance because of the fresnel effect
+            let is_solid: bool = material.transmission * fresnel_reflect <= abs(random_vec.w);
+            // Determine local color considering PBR attributes and lighting
+            let local_color: vec3<f32> = reservoirSample(material, ray, random_vec, - sign_dir * smooth_n, geometry_offset);
+            // Calculate primary light sources for this pass if ray hits non translucent object
+            final_color += local_color * importancy_factor;
+
+            // Multiply albedo with either absorption value or filter color
+            importancy_factor = importancy_factor * material.albedo;
+            // Handle translucency and skip rest of light calculation
+            if(is_solid) {
             // Calculate reflecting ray
-            ray.unit_direction = normalize(mix(reflect(ray.unit_direction, smooth_n), random_spheare_vec, roughness_brdf));
-        } else {
-            let eta: f32 = mix(1.0f / material.ior, material.ior, max(sign_dir, 0.0f));
-            // Refract ray depending on IOR (material.tpo.z)
-            ray.unit_direction = normalize(mix(refract(ray.unit_direction, smooth_n, eta), random_spheare_vec, roughness_brdf));
+                ray.unit_direction = normalize(mix(reflect(ray.unit_direction, smooth_n), random_spheare_vec, roughness_brdf));
+            } else {
+                let eta: f32 = mix(1.0f / material.ior, material.ior, max(sign_dir, 0.0f));
+                // Refract ray depending on IOR (material.tpo.z)
+                ray.unit_direction = normalize(mix(refract(ray.unit_direction, smooth_n, eta), random_spheare_vec, roughness_brdf));
+            }
+            // Add geometry offset to ray origin
+            ray.origin = geometry_offset * ray.unit_direction + ray.origin;
         }
-        // Calculate next intersection
-        ray.origin = geometry_offset * ray.unit_direction + ray.origin;
-        hit = traverseInstanceBVH(ray);
-        // Stop loop if there is no intersection and ray goes in the void
-        if (hit.instance_index == UINT_MAX) {
+
+        workgroup_stop_tracing = true;
+        // Synchronize workgroup to ensure that all threads have finished.
+        workgroupBarrier();
+        // Test for early termination
+        continue_tracing &= i + 1u < uniforms_uint.max_reflections && length(importancy_factor) >= uniforms_float.min_importancy * SQRT3;
+        if (continue_tracing) {
+            workgroup_stop_tracing = false;
+        }
+        // Terminate if all threads stoped tracing.
+        if (workgroupUniformLoad(&workgroup_stop_tracing)) {
             break;
         }
+
+        // Calculate next intersection
+        hit = traverseInstanceBVH(ray, continue_tracing);
+
+        workgroup_stop_tracing = true;
+        // Synchronize workgroup to ensure that all threads have finished.
+        workgroupBarrier();
+        // Stop loop if there is no intersection and ray goes in the void
+        continue_tracing &= hit.instance_index != UINT_MAX;
+        if (continue_tracing) {
+            workgroup_stop_tracing = false;
+        }
+        workgroupBarrier();
         // Update other parameters
         last_hit_point = ray.origin;
+        i += 1u;
+        // continue_tracing = i < uniforms_uint.max_reflections && length(importancy_factor) >= uniforms_float.min_importancy * SQRT3;
     }
     // Return final pixel color
     return final_color + importancy_factor * uniforms_float.ambient;
 }
 
+
+fn write_no_hit(screen_pos: vec2<u32>) {
+    // If there is no triangle render ambient color 
+    textureStore(compute_out, screen_pos, 0, vec4<f32>(uniforms_float.ambient, 1.0f));
+    // And overwrite position with 0 0 0 0
+    if (uniforms_uint.is_temporal == 1u) {
+        // Store position in target
+        textureStore(compute_out, screen_pos, 1, vec4<f32>(0.0f));
+    }
+}
+
+var<workgroup> workgroup_any_hit: bool;
+var<workgroup> workgroup_sampling_factor: u32;
 
 @compute
 @workgroup_size(8, 8)
@@ -856,14 +1177,13 @@ fn compute(
     let instance_index: u32 = texture_offset[buffer_index * 2u] - 1u;
     let triangle_index: u32 = texture_offset[buffer_index * 2u + 1u] - 1u;
 
-    if (instance_index == UINT_MAX && triangle_index == UINT_MAX) {
-        // If there is no triangle render ambient color 
-        textureStore(compute_out, screen_pos, 0, vec4<f32>(uniforms_float.ambient, 1.0f));
-        // And overwrite position with 0 0 0 0
-        if (uniforms_uint.is_temporal == 1u) {
-            // Store position in target
-            textureStore(compute_out, screen_pos, 1, vec4<f32>(0.0f));
-        }
+    let no_hit: bool = instance_index == UINT_MAX && triangle_index == UINT_MAX;
+    if (!no_hit) {
+        workgroup_any_hit = true;
+    }
+    // Terminate if entire workgroup desn't contain any hit.
+    if (!workgroupUniformLoad(&workgroup_any_hit)) {
+        write_no_hit(screen_pos);
         return;
     }
     
@@ -876,12 +1196,13 @@ fn compute(
     let init_hit: Hit = Hit(vec3<f32>(distance(absolute_position, uniforms_float.camera_position), uvw.yz), instance_index, triangle_index);
     // let camera_ray: Ray = Ray(absolute_position, - normalize(uniforms_float.camera_position - absolute_position));
 
-    // Determine if additional samples are needed
-    var sampleFactor: u32 = 1u;
+    // Determine if additional samples are needed, initialize to 1
+    workgroup_sampling_factor = 1u;
+    // Synchronize workgroup
+    workgroupBarrier();
     
     if (uniforms_uint.is_temporal == 1u) {
         // Get count of shifted texture
-
         let shift_out_float_0: vec4<f32> = textureLoad(shift_out_float, screen_pos, 0, 0);
         let shift_out_float_1: vec4<f32> = textureLoad(shift_out_float, screen_pos, 1, 0);
 
@@ -903,7 +1224,7 @@ fn compute(
         let last_frame = old_temporal_target == uniforms_uint.temporal_target;
 
         if (fine_count == 0u || !last_frame) {
-            sampleFactor = 2u;
+            workgroup_sampling_factor = 1u;
         }
         /*
         
@@ -924,18 +1245,26 @@ fn compute(
         */
     }
     
-
+    let uniform_sample_factor: u32 = workgroupUniformLoad(&workgroup_sampling_factor);
     var final_color = vec3<f32>(0.0f);
     // Generate multiple samples
-    for(var i: u32 = 0u; i < uniforms_uint.samples * sampleFactor; i++) {
+    for(var i: u32 = 0u; i < uniforms_uint.samples * uniform_sample_factor; i++) {
+        workgroupBarrier();
         // Use cosine as noise in random coordinate picker
         let cos_sample_n = cos(f32(i));
-        final_color += lightTrace(init_hit, absolute_position, uniforms_float.camera_position, clip_space, cos_sample_n);
+        final_color += lightTrace(init_hit, absolute_position, uniforms_float.camera_position, clip_space, cos_sample_n, !no_hit);
     }
 
     // Average ray colors over samples.
-    let inv_samples: f32 = 1.0f / f32(uniforms_uint.samples * sampleFactor);
+    let inv_samples: f32 = 1.0f / f32(uniforms_uint.samples * uniform_sample_factor);
     final_color *= inv_samples;
+
+
+    // BREAK UNIFORM CONTROL FLOW
+    if (no_hit) {
+        write_no_hit(screen_pos);
+        return;
+    }
 
     // Write to additional textures for temporal pass
     if (uniforms_uint.is_temporal == 1u) {

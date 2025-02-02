@@ -60,7 +60,7 @@ let sphere = await loadObj('sphere');
 // let bike = await loadObj('bike');
 // const fullScene1 = scene.instance(fullScene);
 const cube1 = scene.instance(cube);
-// const cube2 = scene.instance(cube);
+const cube2 = scene.instance(cube);
 /*
 const monkey1 = scene.instance(monkey);
 */
@@ -78,14 +78,11 @@ cube1.transform.position = new Vector(0, -102, 0);
 cube1.transform.scaleFactor = 100;
 cube1.material.roughness = 1.0;
 cube1.material.metallic = 0.0;
-/*
 cube2.transform.position = new Vector(100, 0, -100);
 cube2.transform.rotateAxis(new Vector(0, 1, 0), Math.PI / 4);
 cube2.transform.scaleFactor = 100;
 cube2.material.roughness = 0.0;
 cube2.material.metallic = 0.5;
-
-
 /*
 fullScene1.transform.position = new Vector(-5, -10, 0);
 fullScene1.transform.scaleFactor = 2;
@@ -139,8 +136,11 @@ dragon_instance.transform.position = new Vector(0, 0, -20);
 dragon_instance.transform.scaleFactor = 1;
 dragon_instance.material.roughness = 0.5;
 dragon_instance.material.metallic = 1.0;
+/*
+
 // init iterator variable for simple animations
 let iterator = 0;
+
 setInterval(() => {
     // increase iterator
     iterator += 0.005;
@@ -148,9 +148,13 @@ setInterval(() => {
     dragon_instance.transform.rotateAxis(new Vector(0, 1, 0), iterator);
     dragon_instance.transform.position = new Vector(Math.sin(iterator) * 10, Math.cos(iterator) * 10, -20);
     // transform3.rotateAxis(new Vector(0, 1, 0), iterator);
-}, 100 / 6);
+}, 100/6);
+
 // instance2.transform.position = new Vector(-30, 0, 0);
+
 // sphere1.transform.position = new Vector(0, 10, 0);
+
+*/
 // Add FPS counter to top-right corner
 const fpsCounter = document.createElement("div");
 // Append it to body.
